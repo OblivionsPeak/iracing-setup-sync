@@ -1,7 +1,7 @@
 """
 iRacing Setup Sync
 Monitors Discord setup channels and downloads .sto files to
-Documents\\iRacing\\setups\\Discord\\<channel-name>\\
+Documents\\iRacing\\setups\\<car>\\Discord\\<channel-name>\\
 """
 
 import asyncio
@@ -11,6 +11,7 @@ import re
 import sys
 import threading
 import tkinter as tk
+import xml.etree.ElementTree as ET
 from tkinter import ttk, scrolledtext, filedialog, messagebox
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -78,29 +79,46 @@ class SetupBot(discord.Client):
     def _channel_names(self) -> set[str]:
         return {c.strip().lower() for c in self._cfg.get('channel_names', [])}
 
-    def _output_dir(self, channel_name: str) -> Path:
-        base = Path(self._cfg.get('output_folder', str(DEFAULT_OUTPUT)))
-        d = base / channel_name
-        d.mkdir(parents=True, exist_ok=True)
-        return d
-
     def _safe_filename(self, name: str) -> str:
         return re.sub(r'[\\/:*?"<>|]', '_', name)
+
+    def _car_path_from_sto(self, data: bytes) -> str | None:
+        """Parse CarPath attribute from .sto XML — returns e.g. 'mx5cup' or None."""
+        try:
+            root = ET.fromstring(data.decode('utf-8', errors='replace'))
+            return root.get('CarPath') or root.get('carPath') or None
+        except ET.ParseError:
+            return None
+
+    def _output_dir(self, channel_name: str, car_path: str | None) -> Path:
+        base = Path(self._cfg.get('output_folder', str(DEFAULT_OUTPUT)))
+        if car_path:
+            # Place under the car's own iRacing folder: setups/<car>/Discord/<channel>/
+            iracing_setups = base.parent.parent  # go up from …/setups/Discord
+            d = iracing_setups / car_path / 'Discord' / channel_name
+        else:
+            # Fallback: couldn't parse car — keep old flat layout
+            d = base / '_unknown_car' / channel_name
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     async def _save_attachment(self, attachment: discord.Attachment, channel_name: str,
                                 posted_at: datetime | None = None) -> bool:
         if not attachment.filename.lower().endswith('.sto'):
             return False
-        out_dir  = self._output_dir(channel_name)
         filename = self._safe_filename(attachment.filename)
-        dest     = out_dir / filename
-        if dest.exists():
-            self._skipped += 1
-            return False
         try:
-            await attachment.save(dest)
-            ts = posted_at.strftime('%Y-%m-%d %H:%M') if posted_at else 'now'
-            self._log(f'  ✓ {channel_name}/{filename}  [{ts}]')
+            data     = await attachment.read()
+            car_path = self._car_path_from_sto(data)
+            out_dir  = self._output_dir(channel_name, car_path)
+            dest     = out_dir / filename
+            if dest.exists():
+                self._skipped += 1
+                return False
+            dest.write_bytes(data)
+            ts       = posted_at.strftime('%Y-%m-%d %H:%M') if posted_at else 'now'
+            car_label = car_path or '(unknown car)'
+            self._log(f'  ✓ {car_label}/{channel_name}/{filename}  [{ts}]')
             self._synced += 1
             return True
         except Exception as e:
@@ -302,7 +320,7 @@ class App(tk.Tk):
         ttk.Entry(of, textvariable=self.v_folder, font=('Segoe UI', 9)).grid(
             row=0, column=0, sticky='ew', padx=(0, 6))
         ttk.Button(of, text='Browse…', command=self._browse_folder).grid(row=0, column=1)
-        tk.Label(of, text='Setups saved as  <folder>\\<channel-name>\\filename.sto',
+        tk.Label(of, text='Setups saved as  <iRacing setups>\\<car>\\Discord\\<channel>\\file.sto',
                  bg=BG2, fg=DIM, font=('Segoe UI', 7)).grid(
                      row=1, column=0, columnspan=2, sticky='w', pady=(4, 0))
 
