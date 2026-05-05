@@ -27,12 +27,24 @@ jobs:
           pip install pyinstaller
           pip install -r requirements.txt
 
-      - name: Inject version from tag
+      - name: Inject secrets and version from tag
         shell: pwsh
         run: |
           $tag = '${{ github.ref_name }}'.TrimStart('v')
           $src = Get-Content setup_sync.py -Raw
+
+          # Inject version
           $src = $src -replace "VERSION\s*=\s*'[^']+'", "VERSION     = '$tag'"
+
+          # Inject bot token (from GitHub Actions secret)
+          $src = $src -replace "'BOT_TOKEN_PLACEHOLDER'", "'${{ secrets.BOT_TOKEN }}'"
+
+          # Inject Discord client ID (from GitHub Actions secret)
+          $src = $src -replace "'CLIENT_ID_PLACEHOLDER'", "'${{ secrets.DISCORD_CLIENT_ID }}'"
+
+          # Inject required guild ID (from GitHub Actions secret)
+          $src = $src -replace "'GUILD_ID_PLACEHOLDER'", "'${{ secrets.DISCORD_GUILD_ID }}'"
+
           Set-Content setup_sync.py $src -NoNewline
 
       - name: Build EXE
@@ -45,18 +57,16 @@ jobs:
           body: |
             ## iRacing Setup Sync ${{ github.ref_name }}
 
-            **Download iRacingSetupSync.exe — no Python required.**
+            **Download iRacingSetupSync.exe — no Python or bot token required.**
 
-            ### Setup (one-time)
-            1. Create a Discord bot at discord.com/developers → New Application → Bot
-            2. Enable **Message Content Intent** under Privileged Gateway Intents
-            3. Copy your bot token
-            4. Invite the bot to your server with **Read Messages** + **Read Message History** permissions
-            5. Run iRacingSetupSync.exe, paste your token, click Start Sync
+            ### Setup (one-time per user)
+            1. Download and run `iRacingSetupSync.exe`
+            2. Click **Login with Discord** and authorise with your Discord account
+            3. Click **Start Sync** — setups will appear in `Documents\iRacing\setups\<car>\Discord\`
 
-            ### What it does
-            - Backfills the last 30 days of .sto files from your setup channels
-            - Watches for new files posted live
-            - Saves to `Documents\iRacing\setups\Discord\<channel-name>\`
+            ### Notes
+            - Backfills the last 30 days of setups on first run
+            - Polls for new setups every 60 seconds while running
+            - Setups are automatically sorted into the correct car folder
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

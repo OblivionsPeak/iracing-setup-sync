@@ -1,7 +1,7 @@
 """
-iRacing Setup Sync v2.0
-OAuth2-based: each user logs in with their own Discord account.
-No bot token required. Uses Discord REST API with polling.
+iRacing Setup Sync v2.1
+Users log in with their own Discord account (OAuth2).
+The bot token is embedded at build time — users never see or enter it.
 Setups saved to: Documents\\iRacing\\setups\\<car>\\Discord\\<channel>\\file.sto
 """
 
@@ -23,18 +23,31 @@ from tkinter import ttk, scrolledtext, filedialog, messagebox
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+import discord
 import requests
 
-# ── Constants ─────────────────────────────────────────────────────────────
+# ── Build-time constants (injected by CI from GitHub Actions secrets) ─────
 
-APP_NAME      = 'iRacing Setup Sync'
-VERSION       = '2.0.0'
-CONFIG_FILE   = Path(os.getenv('APPDATA', '.')) / 'iRacingSetupSync' / 'config.json'
+# The CI build step replaces this placeholder string with the real token.
+# In source code it is intentionally blank — the EXE is the only place
+# a real value appears.
+_EMBEDDED_BOT_TOKEN = 'BOT_TOKEN_PLACEHOLDER'
+_DISCORD_CLIENT_ID  = 'CLIENT_ID_PLACEHOLDER'   # public, safe in source
+
+# ── Runtime constants ─────────────────────────────────────────────────────
+
+APP_NAME       = 'iRacing Setup Sync'
+VERSION        = '2.1.0'
+CONFIG_FILE    = Path(os.getenv('APPDATA', '.')) / 'iRacingSetupSync' / 'config.json'
 DEFAULT_OUTPUT = Path.home() / 'Documents' / 'iRacing' / 'setups' / 'Discord'
-DISCORD_API   = 'https://discord.com/api/v10'
+DISCORD_API    = 'https://discord.com/api/v10'
 OAUTH_REDIRECT = 'http://localhost:8765/callback'
-OAUTH_SCOPES  = 'identify guilds'
-POLL_INTERVAL = 60   # seconds between live polls
+OAUTH_SCOPES   = 'identify guilds'
+POLL_INTERVAL  = 60   # seconds between live polls
+
+# The server ID of your Discord server (used to verify membership).
+# Replace with your server's ID (right-click server → Copy Server ID in Discord).
+_REQUIRED_GUILD_ID = 'GUILD_ID_PLACEHOLDER'
 
 DEFAULT_CHANNELS = [
     'hymo-setups',
@@ -44,7 +57,6 @@ DEFAULT_CHANNELS = [
 ]
 
 DEFAULT_CONFIG = {
-    'client_id':     '',
     'channel_names': list(DEFAULT_CHANNELS),
     'output_folder': str(DEFAULT_OUTPUT),
     'backfill_days': 30,
@@ -59,6 +71,7 @@ BG2    = '#2b2d31'
 BG3    = '#313338'
 ACCENT = '#5865f2'
 GREEN  = '#23a55a'
+RED    = '#ed4245'
 TEXT   = '#dbdee1'
 DIM    = '#949ba4'
 BORDER = '#3f4248'
@@ -78,7 +91,7 @@ def save_config(cfg: dict):
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
 
-# ── OAuth2 PKCE helpers ───────────────────────────────────────────────────
+# ── OAuth2 PKCE (user authentication only) ───────────────────────────────
 
 def _pkce_pair() -> tuple[str, str]:
     verifier  = secrets.token_urlsafe(96)
@@ -87,9 +100,9 @@ def _pkce_pair() -> tuple[str, str]:
     ).rstrip(b'=').decode()
     return verifier, challenge
 
-def _auth_url(client_id: str, state: str, challenge: str) -> str:
+def _auth_url(state: str, challenge: str) -> str:
     return 'https://discord.com/oauth2/authorize?' + urllib.parse.urlencode({
-        'client_id':             client_id,
+        'client_id':             _DISCORD_CLIENT_ID,
         'redirect_uri':          OAUTH_REDIRECT,
         'response_type':         'code',
         'scope':                 OAUTH_SCOPES,
@@ -98,17 +111,15 @@ def _auth_url(client_id: str, state: str, challenge: str) -> str:
         'code_challenge_method': 'S256',
     })
 
-class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
-    """Single-use HTTP handler that captures the OAuth2 callback."""
+class _CallbackHandler(http.server.BaseHTTPRequestHandler):
     result: dict | None = None
 
     def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        params = urllib.parse.parse_qs(parsed.query)
-        _OAuthCallbackHandler.result = {
-            'code':  (params.get('code',  [None])[0]),
-            'state': (params.get('state', [None])[0]),
-            'error': (params.get('error', [None])[0]),
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        _CallbackHandler.result = {
+            'code':  params.get('code',  [None])[0],
+            'state': params.get('state', [None])[0],
+            'error': params.get('error', [None])[0],
         }
         body = (
             b'<html><body style="font-family:sans-serif;background:#1e1f22;color:#dbdee1;'
@@ -125,22 +136,22 @@ class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-def _wait_for_callback(timeout: int = 120) -> dict | None:
-    _OAuthCallbackHandler.result = None
-    srv = http.server.HTTPServer(('localhost', 8765), _OAuthCallbackHandler)
+def _wait_for_callback(timeout: int = 180) -> dict | None:
+    _CallbackHandler.result = None
+    srv = http.server.HTTPServer(('localhost', 8765), _CallbackHandler)
     srv.timeout = timeout
     srv.handle_request()
     srv.server_close()
-    return _OAuthCallbackHandler.result
+    return _CallbackHandler.result
 
-def _exchange_code(client_id: str, code: str, verifier: str) -> dict:
+def _exchange_code(code: str, verifier: str) -> dict:
     r = requests.post(
         f'{DISCORD_API}/oauth2/token',
         data={
             'grant_type':    'authorization_code',
             'code':          code,
             'redirect_uri':  OAUTH_REDIRECT,
-            'client_id':     client_id,
+            'client_id':     _DISCORD_CLIENT_ID,
             'code_verifier': verifier,
         },
         headers={'Content-Type': 'application/x-www-form-urlencoded'},
@@ -149,13 +160,13 @@ def _exchange_code(client_id: str, code: str, verifier: str) -> dict:
     r.raise_for_status()
     return r.json()
 
-def _do_refresh(client_id: str, refresh_token: str) -> dict:
+def _refresh_oauth(refresh_token: str) -> dict:
     r = requests.post(
         f'{DISCORD_API}/oauth2/token',
         data={
             'grant_type':    'refresh_token',
             'refresh_token': refresh_token,
-            'client_id':     client_id,
+            'client_id':     _DISCORD_CLIENT_ID,
         },
         headers={'Content-Type': 'application/x-www-form-urlencoded'},
         timeout=15,
@@ -163,56 +174,32 @@ def _do_refresh(client_id: str, refresh_token: str) -> dict:
     r.raise_for_status()
     return r.json()
 
-# ── Discord REST client ───────────────────────────────────────────────────
-
-class DiscordClient:
-    def __init__(self, access_token: str):
-        self._sess = requests.Session()
-        self._sess.headers['Authorization'] = f'Bearer {access_token}'
-
-    def _get(self, path: str, **params) -> dict | list:
-        r = self._sess.get(f'{DISCORD_API}{path}', params=params or None, timeout=20)
+def _verify_guild_membership(access_token: str) -> bool:
+    """Returns True if the user is a member of the required server."""
+    if _REQUIRED_GUILD_ID == 'GUILD_ID_PLACEHOLDER':
+        return True   # dev build — skip check
+    try:
+        r = requests.get(
+            f'{DISCORD_API}/users/@me/guilds',
+            headers={'Authorization': f'Bearer {access_token}'},
+            timeout=10,
+        )
         r.raise_for_status()
-        return r.json()
+        guild_ids = {g['id'] for g in r.json()}
+        return _REQUIRED_GUILD_ID in guild_ids
+    except Exception:
+        return False
 
-    def get_user(self) -> dict:
-        return self._get('/users/@me')
+def _get_discord_user(access_token: str) -> dict:
+    r = requests.get(
+        f'{DISCORD_API}/users/@me',
+        headers={'Authorization': f'Bearer {access_token}'},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
 
-    def get_guilds(self) -> list:
-        return self._get('/users/@me/guilds')
-
-    def get_channels(self, guild_id: str) -> list:
-        return self._get(f'/guilds/{guild_id}/channels')
-
-    def get_messages(self, channel_id: str, after: str | None = None) -> list:
-        kw = {'limit': 100}
-        if after:
-            kw['after'] = after
-        return self._get(f'/channels/{channel_id}/messages', **kw)
-
-    def get_active_threads(self, guild_id: str) -> dict:
-        return self._get(f'/guilds/{guild_id}/threads/active')
-
-    def get_archived_threads(self, channel_id: str, before: str | None = None) -> dict:
-        kw = {'limit': 100}
-        if before:
-            kw['before'] = before
-        try:
-            return self._get(f'/channels/{channel_id}/threads/archived/public', **kw)
-        except requests.HTTPError:
-            return {'threads': []}
-
-    def get_thread_messages(self, thread_id: str, after: str | None = None) -> list:
-        kw = {'limit': 100}
-        if after:
-            kw['after'] = after
-        return self._get(f'/channels/{thread_id}/messages', **kw)
-
-# ── Sync engine ───────────────────────────────────────────────────────────
-
-def _date_to_snowflake(dt: datetime) -> str:
-    ms = int(dt.timestamp() * 1000)
-    return str((ms - 1420070400000) << 22)
+# ── Discord bot sync engine ───────────────────────────────────────────────
 
 def _safe_name(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', '_', name)
@@ -225,13 +212,11 @@ def _car_path(data: bytes) -> str | None:
         return None
 
 class SyncEngine:
-    def __init__(self, cfg: dict, client: DiscordClient, log_fn, status_fn):
-        self._cfg     = cfg
-        self._client  = client
-        self._log     = log_fn
-        self._status  = status_fn
-        self._stop    = threading.Event()
-        self._last_id: dict[str, str] = {}  # channel_id → last seen snowflake
+    def __init__(self, cfg: dict, log_fn, status_fn):
+        self._cfg    = cfg
+        self._log    = log_fn
+        self._status = status_fn
+        self._stop   = threading.Event()
         self._synced  = 0
         self._skipped = 0
 
@@ -239,198 +224,136 @@ class SyncEngine:
         self._stop.set()
 
     def run(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        bot = discord.Client(intents=intents)
+
+        @bot.event
+        async def on_ready():
+            self._log(f'Bot connected — backfilling history…')
+            self._status('Syncing history…')
+            await self._backfill(bot)
+            self._log(
+                f'Backfill complete — {self._synced} downloaded, {self._skipped} already present.'
+            )
+            self._status(f'Live — watching {len(self._channel_names())} channel(s)')
+
+        @bot.event
+        async def on_message(message: discord.Message):
+            if message.author == bot.user:
+                return
+            channel_name = self._resolve_name(message.channel)
+            if not channel_name:
+                return
+            for att in message.attachments:
+                await self._save_attachment(att, channel_name, message.created_at)
+
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        def _check_stop():
+            if self._stop.is_set():
+                loop.create_task(bot.close())
+            else:
+                loop.call_later(1, _check_stop)
+
+        loop.call_later(1, _check_stop)
         try:
-            self._run()
+            loop.run_until_complete(bot.start(_EMBEDDED_BOT_TOKEN))
         except Exception as e:
-            self._log(f'Sync error: {e}')
-            self._status('Error — see log')
+            if 'Improper token' in str(e) or 'LoginFailure' in str(type(e).__name__):
+                self._log('ERROR: Bot token is invalid or not yet configured.')
+            else:
+                self._log(f'Bot error: {e}')
+            self._status('Bot error — see log')
+        finally:
+            loop.close()
 
     def _channel_names(self) -> set[str]:
         return {c.strip().lower() for c in self._cfg.get('channel_names', [])}
 
+    def _resolve_name(self, channel) -> str | None:
+        if isinstance(channel, discord.Thread):
+            return channel.parent.name.lower() if channel.parent else None
+        if isinstance(channel, discord.TextChannel):
+            return channel.name.lower() if channel.name.lower() in self._channel_names() else None
+        return None
+
     def _output_dir(self, channel_name: str, car: str | None) -> Path:
         base = Path(self._cfg.get('output_folder', str(DEFAULT_OUTPUT)))
         if car:
-            # setups/<car>/Discord/<channel>/
             d = base.parent.parent / car / 'Discord' / channel_name
         else:
             d = base / '_unknown_car' / channel_name
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def _save(self, data: bytes, filename: str, channel_name: str,
-              posted_at: datetime | None) -> bool:
-        filename = _safe_name(filename)
-        car      = _car_path(data)
-        dest     = self._output_dir(channel_name, car) / filename
-        if dest.exists():
-            self._skipped += 1
+    async def _save_attachment(self, att: discord.Attachment, channel_name: str,
+                                posted_at: datetime | None) -> bool:
+        if not att.filename.lower().endswith('.sto'):
             return False
-        dest.write_bytes(data)
-        ts        = posted_at.strftime('%Y-%m-%d %H:%M') if posted_at else 'now'
-        car_label = car or '(unknown car)'
-        self._log(f'  ✓ {car_label}/{channel_name}/{filename}  [{ts}]')
-        self._synced += 1
-        return True
+        try:
+            data = await att.read()
+            car  = _car_path(data)
+            dest = self._output_dir(channel_name, car) / _safe_name(att.filename)
+            if dest.exists():
+                self._skipped += 1
+                return False
+            dest.write_bytes(data)
+            ts  = posted_at.strftime('%Y-%m-%d %H:%M') if posted_at else 'now'
+            self._log(f'  ✓ {car or "?"}/{channel_name}/{att.filename}  [{ts}]')
+            self._synced += 1
+            return True
+        except Exception as e:
+            self._log(f'  ✗ {att.filename}: {e}')
+            return False
 
-    def _process_messages(self, messages: list, channel_name: str) -> int:
+    async def _scan_thread(self, thread: discord.Thread, channel_name: str,
+                           cutoff: datetime) -> int:
         count = 0
-        for msg in messages:
-            ts = None
-            try:
-                ts = datetime.fromisoformat(msg['timestamp'].replace('Z', '+00:00'))
-            except Exception:
-                pass
-            for att in msg.get('attachments', []):
-                if not att['filename'].lower().endswith('.sto'):
-                    continue
-                try:
-                    r = requests.get(att['url'], timeout=30)
-                    r.raise_for_status()
-                    if self._save(r.content, att['filename'], channel_name, ts):
+        try:
+            async for msg in thread.history(limit=None, after=cutoff, oldest_first=True):
+                for att in msg.attachments:
+                    if await self._save_attachment(att, channel_name, msg.created_at):
                         count += 1
-                except Exception as e:
-                    self._log(f'  ✗ {att["filename"]}: {e}')
+        except discord.Forbidden:
+            self._log(f'    No permission: {thread.name}')
+        except Exception as e:
+            self._log(f'    Thread error {thread.name}: {e}')
         return count
 
-    def _scan_channel(self, channel_id: str, channel_name: str,
-                      after: str | None = None) -> str | None:
-        """Fetch all messages in a channel after `after` snowflake. Returns last ID seen."""
-        last = after
-        while True:
-            try:
-                msgs = self._client.get_messages(channel_id, after=last)
-            except requests.HTTPError as e:
-                self._log(f'  Cannot read #{channel_name}: {e}')
-                break
-            if not msgs:
-                break
-            msgs.sort(key=lambda m: m['id'])
-            self._process_messages(msgs, channel_name)
-            last = msgs[-1]['id']
-            if len(msgs) < 100:
-                break
-        return last
-
-    def _scan_thread(self, thread_id: str, channel_name: str,
-                     after: str | None = None) -> str | None:
-        last = after
-        while True:
-            try:
-                msgs = self._client.get_thread_messages(thread_id, after=last)
-            except Exception:
-                break
-            if not msgs:
-                break
-            msgs.sort(key=lambda m: m['id'])
-            self._process_messages(msgs, channel_name)
-            last = msgs[-1]['id']
-            if len(msgs) < 100:
-                break
-        return last
-
-    def _run(self):
-        channel_names = self._channel_names()
-        self._log('Finding your servers and channels…')
-
-        guilds = self._client.get_guilds()
-        # channel_id → (channel_name, guild_id)
-        targets: dict[str, tuple[str, str]] = {}
-        # thread_id → (parent_channel_name, guild_id)
-        thread_targets: dict[str, tuple[str, str]] = {}
-
-        for guild in guilds:
-            gid = guild['id']
-            try:
-                channels = self._client.get_channels(gid)
-            except Exception:
-                continue
-            for ch in channels:
-                if ch.get('type') == 0 and ch['name'].lower() in channel_names:
-                    targets[ch['id']] = (ch['name'], gid)
-
-        if not targets:
-            self._log('No matching channels found in your servers.')
-            self._status('No channels found — check channel names in settings')
-            return
-
-        # ── Backfill ──────────────────────────────────────────────────────
+    async def _backfill(self, bot: discord.Client):
         days   = int(self._cfg.get('backfill_days', 30))
         cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
-        after  = _date_to_snowflake(cutoff)
-        self._log(f'Backfilling last {days} days from {len(targets)} channel(s)…')
+        names  = self._channel_names()
 
-        for cid, (cname, gid) in targets.items():
-            self._log(f'  #{cname}')
-            last = self._scan_channel(cid, cname, after=after)
-            if last:
-                self._last_id[cid] = last
-
-            # Active threads belonging to this channel
-            try:
-                active = self._client.get_active_threads(gid)
-                for t in active.get('threads', []):
-                    if t.get('parent_id') == cid:
-                        self._log(f'    Thread: {t["name"]}')
-                        tlast = self._scan_thread(t['id'], cname, after=after)
-                        if tlast:
-                            self._last_id[t['id']] = tlast
-                            thread_targets[t['id']] = (cname, gid)
-            except Exception as e:
-                self._log(f'    Could not list active threads: {e}')
-
-            # Archived threads
-            try:
-                archived = self._client.get_archived_threads(cid)
-                for t in archived.get('threads', []):
-                    arc_ts_str = t.get('thread_metadata', {}).get('archive_timestamp', '')
-                    if arc_ts_str:
-                        arc_ts = datetime.fromisoformat(arc_ts_str.replace('Z', '+00:00'))
-                        if arc_ts < cutoff:
-                            continue
-                    self._log(f'    Archived thread: {t["name"]}')
-                    tlast = self._scan_thread(t['id'], cname, after=after)
-                    if tlast:
-                        self._last_id[t['id']] = tlast
-                        thread_targets[t['id']] = (cname, gid)
-            except Exception as e:
-                self._log(f'    Could not list archived threads: {e}')
-
-        self._log(
-            f'Backfill complete — {self._synced} downloaded, {self._skipped} already present.'
-        )
-        self._status(f'Live — polling every {POLL_INTERVAL}s')
-
-        # ── Poll loop ─────────────────────────────────────────────────────
-        while not self._stop.is_set():
-            self._stop.wait(POLL_INTERVAL)
-            if self._stop.is_set():
-                break
-            new = 0
-            for cid, (cname, gid) in targets.items():
-                last = self._scan_channel(cid, cname, after=self._last_id.get(cid))
-                if last:
-                    self._last_id[cid] = last
-                # Check for newly created threads
+        for guild in bot.guilds:
+            for channel in guild.text_channels:
+                if channel.name.lower() not in names:
+                    continue
+                self._log(f'  #{channel.name}')
                 try:
-                    active = self._client.get_active_threads(gid)
-                    for t in active.get('threads', []):
-                        if t.get('parent_id') == cid:
-                            tlast = self._scan_thread(
-                                t['id'], cname, after=self._last_id.get(t['id']))
-                            if tlast:
-                                self._last_id[t['id']] = tlast
-                                thread_targets[t['id']] = (cname, gid)
+                    async for msg in channel.history(limit=None, after=cutoff, oldest_first=True):
+                        for att in msg.attachments:
+                            await self._save_attachment(att, channel.name, msg.created_at)
+                except discord.Forbidden:
+                    self._log(f'  No permission: #{channel.name}')
+
+                for thread in channel.threads:
+                    self._log(f'    Thread: {thread.name}')
+                    await self._scan_thread(thread, channel.name, cutoff)
+
+                try:
+                    async for thread in channel.archived_threads(limit=None):
+                        if (thread.archive_timestamp and thread.archive_timestamp < cutoff):
+                            continue
+                        self._log(f'    Archived: {thread.name}')
+                        await self._scan_thread(thread, channel.name, cutoff)
                 except Exception:
                     pass
-            for tid, (cname, gid) in thread_targets.items():
-                if tid not in {t['id'] for g in [self._client.get_active_threads(gid)]
-                               for t in g.get('threads', [])}:
-                    continue
-            if new:
-                self._log(f'[POLL] {new} new setup(s) downloaded')
 
-# ── App ───────────────────────────────────────────────────────────────────
+# ── Tkinter UI ────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
     def __init__(self):
@@ -438,7 +361,7 @@ class App(tk.Tk):
         self.title(f'{APP_NAME} v{VERSION}')
         self.configure(bg=BG)
         self.resizable(True, True)
-        self.minsize(620, 600)
+        self.minsize(620, 580)
         try:
             _ico = os.path.join(
                 getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__))),
@@ -448,27 +371,24 @@ class App(tk.Tk):
         except Exception:
             pass
         self._cfg         = load_config()
-        self._sync_thread: threading.Thread | None = None
         self._engine: SyncEngine | None = None
+        self._sync_thread: threading.Thread | None = None
         self._running     = False
         self._build_ui()
         self.protocol('WM_DELETE_WINDOW', self._on_close)
-        # Auto-refresh user label if already logged in
         if self._cfg.get('discord_user'):
             self._user_var.set(f'Logged in as  {self._cfg["discord_user"]}')
-
-    # ── UI ───────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         style = ttk.Style(self)
         style.theme_use('clam')
-        style.configure('TFrame',       background=BG)
-        style.configure('TLabelframe',  background=BG2, foreground=TEXT, relief='flat')
+        style.configure('TFrame',        background=BG)
+        style.configure('TLabelframe',   background=BG2, foreground=TEXT, relief='flat')
         style.configure('TLabelframe.Label', background=BG2, foreground=TEXT,
                         font=('Segoe UI', 8, 'bold'))
-        style.configure('TEntry',       fieldbackground=BG3, foreground=TEXT,
+        style.configure('TEntry',        fieldbackground=BG3, foreground=TEXT,
                         insertcolor=TEXT, bordercolor=BORDER, relief='flat')
-        style.configure('TButton',      background=BG3, foreground=TEXT,
+        style.configure('TButton',       background=BG3, foreground=TEXT,
                         font=('Segoe UI', 9))
         style.configure('Start.TButton', background=ACCENT, foreground='white',
                         font=('Segoe UI', 10, 'bold'))
@@ -491,28 +411,14 @@ class App(tk.Tk):
         body = ttk.Frame(self)
         body.pack(fill='both', expand=True, padx=14, pady=10)
 
-        # Discord login
+        # Discord account
         af = ttk.LabelFrame(body, text='DISCORD ACCOUNT', padding=8)
         af.pack(fill='x', pady=(0, 8))
-        af.columnconfigure(1, weight=1)
-
-        tk.Label(af, text='Client ID:', bg=BG2, fg=DIM,
-                 font=('Segoe UI', 8)).grid(row=0, column=0, sticky='w', padx=(0, 8))
-        self.v_client_id = tk.StringVar(value=self._cfg.get('client_id', ''))
-        ttk.Entry(af, textvariable=self.v_client_id,
-                  font=('Segoe UI', 9)).grid(row=0, column=1, sticky='ew', padx=(0, 8))
-        ttk.Button(af, text='Login with Discord', style='Login.TButton',
-                   command=self._do_login).grid(row=0, column=2)
-
         self._user_var = tk.StringVar(value='Not logged in')
         tk.Label(af, textvariable=self._user_var, bg=BG2, fg=GREEN,
-                 font=('Segoe UI', 8)).grid(row=1, column=0, columnspan=3,
-                                             sticky='w', pady=(4, 0))
-        tk.Label(af,
-                 text='Get your Client ID at discord.com/developers → your app → General Information.\n'
-                      'Add  http://localhost:8765/callback  as a Redirect URI under OAuth2.',
-                 bg=BG2, fg=DIM, font=('Segoe UI', 7), justify='left').grid(
-                     row=2, column=0, columnspan=3, sticky='w', pady=(4, 0))
+                 font=('Segoe UI', 10, 'bold')).pack(side='left')
+        ttk.Button(af, text='Login with Discord', style='Login.TButton',
+                   command=self._do_login).pack(side='right')
 
         # Output folder
         of = ttk.LabelFrame(body, text='OUTPUT FOLDER', padding=8)
@@ -571,83 +477,59 @@ class App(tk.Tk):
     # ── OAuth2 login ─────────────────────────────────────────────────────
 
     def _do_login(self):
-        client_id = self.v_client_id.get().strip()
-        if not client_id:
-            messagebox.showerror('Missing Client ID',
-                                 'Enter your Discord application Client ID first.')
+        if _DISCORD_CLIENT_ID == 'CLIENT_ID_PLACEHOLDER':
+            messagebox.showerror('Dev build',
+                                 'This is a dev build — Client ID not injected yet.')
             return
-        self._user_var.set('Waiting for browser login…')
-        threading.Thread(target=self._login_flow, args=(client_id,), daemon=True).start()
+        self._user_var.set('Waiting for browser…')
+        threading.Thread(target=self._login_flow, daemon=True).start()
 
-    def _login_flow(self, client_id: str):
+    def _login_flow(self):
         try:
             verifier, challenge = _pkce_pair()
             state = secrets.token_hex(16)
-            url   = _auth_url(client_id, state, challenge)
-            webbrowser.open(url)
-            self.log('Browser opened — please authorise the app in Discord.')
+            webbrowser.open(_auth_url(state, challenge))
+            self.log('Browser opened — please authorise the app.')
 
-            result = _wait_for_callback(timeout=180)
+            result = _wait_for_callback()
             if not result or result.get('error'):
-                self.log(f'Login cancelled or failed: {result}')
-                self.after(0, lambda: self._user_var.set('Login failed — try again'))
+                self.after(0, lambda: self._user_var.set('Login cancelled'))
                 return
             if result.get('state') != state:
-                self.log('State mismatch — possible CSRF, aborting.')
+                self.log('State mismatch — aborting.')
                 return
 
-            tokens = _exchange_code(client_id, result['code'], verifier)
+            tokens = _exchange_code(result['code'], verifier)
             access  = tokens['access_token']
             refresh = tokens.get('refresh_token', '')
             expiry  = time.time() + tokens.get('expires_in', 604800)
 
-            dc = DiscordClient(access)
-            user = dc.get_user()
-            name = user.get('username', '?')
+            if not _verify_guild_membership(access):
+                self.log('ERROR: You are not a member of the required server.')
+                self.after(0, lambda: self._user_var.set('Not in server — access denied'))
+                return
 
+            user = _get_discord_user(access)
+            name = user.get('username', '?')
             self._cfg.update({
-                'client_id':    client_id,
-                'access_token': access,
+                'access_token':  access,
                 'refresh_token': refresh,
                 'token_expiry':  expiry,
                 'discord_user':  name,
             })
             save_config(self._cfg)
-            self.log(f'Logged in as {name}')
+            self.log(f'Logged in as {name} — server membership verified.')
             self.after(0, lambda: self._user_var.set(f'Logged in as  {name}'))
         except Exception as e:
             self.log(f'Login error: {e}')
             self.after(0, lambda: self._user_var.set('Login error — see log'))
-
-    def _ensure_token(self) -> str | None:
-        """Return a valid access token, refreshing if needed."""
-        if time.time() < self._cfg.get('token_expiry', 0) - 60:
-            return self._cfg['access_token']
-        refresh = self._cfg.get('refresh_token', '')
-        if not refresh:
-            return None
-        try:
-            tokens  = _do_refresh(self._cfg['client_id'], refresh)
-            access  = tokens['access_token']
-            self._cfg.update({
-                'access_token':  access,
-                'refresh_token': tokens.get('refresh_token', refresh),
-                'token_expiry':  time.time() + tokens.get('expires_in', 604800),
-            })
-            save_config(self._cfg)
-            self.log('Token refreshed.')
-            return access
-        except Exception as e:
-            self.log(f'Token refresh failed: {e} — please log in again.')
-            return None
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
     def log(self, msg: str):
         def _do():
             self.log_box.config(state='normal')
-            ts = datetime.now().strftime('%H:%M:%S')
-            self.log_box.insert('end', f'[{ts}] {msg}\n')
+            self.log_box.insert('end', f'[{datetime.now().strftime("%H:%M:%S")}] {msg}\n')
             self.log_box.see('end')
             self.log_box.config(state='disabled')
         self.after(0, _do)
@@ -670,10 +552,6 @@ class App(tk.Tk):
         self.log_box.delete('1.0', 'end')
         self.log_box.config(state='disabled')
 
-    def _read_channels(self) -> list[str]:
-        raw = self.channel_box.get('1.0', 'end').strip()
-        return [ln.strip() for ln in raw.splitlines() if ln.strip()]
-
     # ── Start / Stop ─────────────────────────────────────────────────────
 
     def _toggle(self):
@@ -683,12 +561,11 @@ class App(tk.Tk):
             self._start()
 
     def _start(self):
-        token = self._ensure_token()
-        if not token:
-            messagebox.showerror('Not logged in',
-                                 'Please log in with Discord before starting.')
+        if not self._cfg.get('discord_user'):
+            messagebox.showerror('Not logged in', 'Please log in with Discord first.')
             return
-        channels = self._read_channels()
+        channels = [ln.strip() for ln in
+                    self.channel_box.get('1.0', 'end').strip().splitlines() if ln.strip()]
         if not channels:
             messagebox.showerror('No channels', 'Enter at least one channel name.')
             return
@@ -704,11 +581,9 @@ class App(tk.Tk):
         })
         save_config(self._cfg)
 
-        client       = DiscordClient(token)
-        self._engine = SyncEngine(dict(self._cfg), client, self.log, self.set_status)
+        self._engine      = SyncEngine(dict(self._cfg), self.log, self.set_status)
         self._sync_thread = threading.Thread(target=self._engine.run, daemon=True)
         self._sync_thread.start()
-
         self._running = True
         self.start_btn.config(text='STOP SYNC')
         self.set_status('Starting…')
@@ -727,8 +602,6 @@ class App(tk.Tk):
         self._stop()
         self.destroy()
 
-
-# ── Entry ─────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     app = App()
