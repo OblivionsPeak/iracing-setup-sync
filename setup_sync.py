@@ -191,6 +191,14 @@ class App(tk.Tk):
         self.configure(bg=BG)
         self.resizable(True, True)
         self.minsize(600, 560)
+        try:
+            _ico = os.path.join(
+                getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__))),
+                'iracing_setup_sync.ico')
+            if os.path.exists(_ico):
+                self.iconbitmap(_ico)
+        except Exception:
+            pass
         self._cfg        = load_config()
         self._bot_thread: BotThread | None = None
         self._running    = False

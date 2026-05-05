@@ -4,7 +4,7 @@ a = Analysis(
     ['setup_sync.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('iracing_setup_sync.ico', '.')],
     hiddenimports=[
         'discord',
         'discord.ext.commands',
@@ -34,5 +34,5 @@ exe = EXE(
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
-    icon=None,
+    icon='iracing_setup_sync.ico',
 )
