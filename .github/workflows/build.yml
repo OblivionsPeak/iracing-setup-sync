@@ -1,0 +1,62 @@
+name: Build & Release EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Inject version from tag
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'.TrimStart('v')
+          $src = Get-Content setup_sync.py -Raw
+          $src = $src -replace "VERSION\s*=\s*'[^']+'", "VERSION     = '$tag'"
+          Set-Content setup_sync.py $src -NoNewline
+
+      - name: Build EXE
+        run: python -m PyInstaller sync.spec --noconfirm
+
+      - name: Upload EXE to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/iRacingSetupSync.exe
+          body: |
+            ## iRacing Setup Sync ${{ github.ref_name }}
+
+            **Download iRacingSetupSync.exe — no Python required.**
+
+            ### Setup (one-time)
+            1. Create a Discord bot at discord.com/developers → New Application → Bot
+            2. Enable **Message Content Intent** under Privileged Gateway Intents
+            3. Copy your bot token
+            4. Invite the bot to your server with **Read Messages** + **Read Message History** permissions
+            5. Run iRacingSetupSync.exe, paste your token, click Start Sync
+
+            ### What it does
+            - Backfills the last 30 days of .sto files from your setup channels
+            - Watches for new files posted live
+            - Saves to `Documents\iRacing\setups\Discord\<channel-name>\`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
