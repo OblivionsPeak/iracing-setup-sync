@@ -176,7 +176,7 @@ def _refresh_oauth(refresh_token: str) -> dict:
 
 def _verify_guild_membership(access_token: str) -> bool:
     """Returns True if the user is a member of the required server."""
-    if _REQUIRED_GUILD_ID == 'GUILD_ID_PLACEHOLDER':
+    if _REQUIRED_GUILD_ID.endswith('PLACEHOLDER'):
         return True   # dev build — skip check
     try:
         r = requests.get(
@@ -262,8 +262,10 @@ class SyncEngine:
         try:
             loop.run_until_complete(bot.start(_EMBEDDED_BOT_TOKEN))
         except Exception as e:
-            if 'Improper token' in str(e) or 'LoginFailure' in str(type(e).__name__):
-                self._log('ERROR: Bot token is invalid or not yet configured.')
+            if _EMBEDDED_BOT_TOKEN.endswith('PLACEHOLDER'):
+                self._log('ERROR: Bot token not injected — use the release EXE, not a dev build.')
+            elif 'Improper token' in str(e) or 'LoginFailure' in str(type(e).__name__):
+                self._log('ERROR: Bot token is invalid.')
             else:
                 self._log(f'Bot error: {e}')
             self._status('Bot error — see log')
@@ -477,7 +479,7 @@ class App(tk.Tk):
     # ── OAuth2 login ─────────────────────────────────────────────────────
 
     def _do_login(self):
-        if _DISCORD_CLIENT_ID == 'CLIENT_ID_PLACEHOLDER':
+        if _DISCORD_CLIENT_ID.endswith('PLACEHOLDER'):
             messagebox.showerror('Dev build',
                                  'This is a dev build — Client ID not injected yet.')
             return
