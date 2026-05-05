@@ -204,12 +204,33 @@ def _get_discord_user(access_token: str) -> dict:
 def _safe_name(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', '_', name)
 
-def _car_path(data: bytes) -> str | None:
+def _car_path(data: bytes) -> tuple[str | None, str]:
+    """
+    Parse CarPath from a .sto XML file.
+    Returns (car_path, debug_info) — car_path is None if not found.
+    """
     try:
-        root = ET.fromstring(data.decode('utf-8', errors='replace'))
-        return root.get('CarPath') or root.get('carPath') or None
-    except ET.ParseError:
-        return None
+        # Strip UTF-8 BOM if present
+        raw = data.lstrip(b'\xef\xbb\xbf')
+        text = raw.decode('utf-8', errors='replace')
+        root = ET.fromstring(text)
+
+        # Try known attribute names
+        for attr in ('CarPath', 'carPath', 'car_path', 'Car'):
+            val = root.get(attr, '').strip()
+            if val:
+                return val, f'tag=<{root.tag}> attr={attr}'
+
+        # Not found — log what attributes ARE present to help diagnosis
+        attrs = ', '.join(f'{k}={v!r}' for k, v in list(root.attrib.items())[:6])
+        return None, f'tag=<{root.tag}> attrs=[{attrs}]'
+
+    except ET.ParseError as e:
+        # Show first 120 chars of raw content to help diagnose
+        preview = data[:120].decode('utf-8', errors='replace').replace('\n', ' ')
+        return None, f'XML parse error: {e} | content: {preview!r}'
+    except Exception as e:
+        return None, f'Error: {e}'
 
 class SyncEngine:
     def __init__(self, cfg: dict, log_fn, status_fn):
@@ -297,14 +318,16 @@ class SyncEngine:
             return False
         try:
             data = await att.read()
-            car  = _car_path(data)
+            car, dbg = _car_path(data)
+            if not car:
+                self._log(f'  ! Could not detect car for {att.filename} — {dbg}')
             dest = self._output_dir(channel_name, car) / _safe_name(att.filename)
             if dest.exists():
                 self._skipped += 1
                 return False
             dest.write_bytes(data)
             ts  = posted_at.strftime('%Y-%m-%d %H:%M') if posted_at else 'now'
-            self._log(f'  ✓ {car or "?"}/{channel_name}/{att.filename}  [{ts}]')
+            self._log(f'  ✓ {car or "_unknown_car"}/{channel_name}/{att.filename}  [{ts}]')
             self._synced += 1
             return True
         except Exception as e:
