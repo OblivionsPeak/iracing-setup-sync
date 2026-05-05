@@ -107,6 +107,31 @@ class SetupBot(discord.Client):
             self._log(f'  ✗ Failed to save {filename}: {e}')
             return False
 
+    def _resolve_channel_name(self, channel) -> str | None:
+        """Return the top-level channel name for both TextChannels and Threads."""
+        if isinstance(channel, discord.Thread):
+            parent = channel.parent
+            return parent.name.lower() if parent else None
+        if isinstance(channel, discord.TextChannel):
+            return channel.name.lower()
+        return None
+
+    async def _scan_thread(self, thread: discord.Thread, channel_name: str,
+                           cutoff: datetime) -> int:
+        count = 0
+        try:
+            async for message in thread.history(limit=None, after=cutoff, oldest_first=True):
+                for attachment in message.attachments:
+                    saved = await self._save_attachment(
+                        attachment, channel_name, message.created_at)
+                    if saved:
+                        count += 1
+        except discord.Forbidden:
+            self._log(f'    No permission to read thread: {thread.name}')
+        except Exception as e:
+            self._log(f'    Error scanning thread {thread.name}: {e}')
+        return count
+
     async def on_ready(self):
         self._log(f'Logged in as {self.user} — backfilling history…')
         self._status('Syncing history…')
@@ -122,33 +147,53 @@ class SetupBot(discord.Client):
                     continue
                 self._log(f'  Scanning #{channel.name}…')
                 count = 0
+
+                # Scan direct channel messages
                 try:
                     async for message in channel.history(limit=None, after=cutoff, oldest_first=True):
                         for attachment in message.attachments:
-                            saved = await self._save_attachment(
-                                attachment, channel.name, message.created_at)
-                            if saved:
+                            if await self._save_attachment(attachment, channel.name, message.created_at):
                                 count += 1
                 except discord.Forbidden:
                     self._log(f'  No permission to read #{channel.name}')
                 except Exception as e:
                     self._log(f'  Error scanning #{channel.name}: {e}')
+
+                # Scan active threads
+                try:
+                    for thread in channel.threads:
+                        self._log(f'    Thread: {thread.name}')
+                        count += await self._scan_thread(thread, channel.name, cutoff)
+                except Exception as e:
+                    self._log(f'  Error listing threads in #{channel.name}: {e}')
+
+                # Scan archived threads
+                try:
+                    async for thread in channel.archived_threads(limit=None):
+                        if thread.archive_timestamp and thread.archive_timestamp < cutoff:
+                            continue
+                        self._log(f'    Archived thread: {thread.name}')
+                        count += await self._scan_thread(thread, channel.name, cutoff)
+                except discord.Forbidden:
+                    pass
+                except Exception as e:
+                    self._log(f'  Error listing archived threads in #{channel.name}: {e}')
+
                 self._log(f'  #{channel.name}: {count} new file(s) downloaded')
 
         self._log(
             f'Backfill complete — {self._synced} downloaded, {self._skipped} already present.'
         )
-        self._status(f'Live — watching {len(channel_names)} channel(s)')
+        self._status(f'Live — watching {len(channel_names)} channel(s) + threads')
 
     async def on_message(self, message: discord.Message):
         if message.author == self.user:
             return
-        if not isinstance(message.channel, discord.TextChannel):
-            return
-        if message.channel.name.lower() not in self._channel_names():
+        channel_name = self._resolve_channel_name(message.channel)
+        if not channel_name or channel_name not in self._channel_names():
             return
         for attachment in message.attachments:
-            await self._save_attachment(attachment, message.channel.name, message.created_at)
+            await self._save_attachment(attachment, channel_name, message.created_at)
 
 # ── Bot thread ────────────────────────────────────────────────────────────
 
